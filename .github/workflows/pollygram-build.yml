@@ -1,0 +1,339 @@
+name: PollyGram build APK
+
+# Self-contained: this one file applies all PollyGram changes to the upstream code and builds the APK.
+# Manual build: GitHub -> Actions -> "PollyGram build APK" -> Run workflow.
+# No secrets needed: signs with the keystore already committed in TMessagesProj/config
+# (same defaults as upstream). The finished APK is attached to the run as an artifact.
+
+on:
+    workflow_dispatch:
+        inputs:
+            version-tag:
+                description: Version label for the APK file name
+                type: string
+                default: '0.1.0'
+
+permissions:
+    contents: read
+
+run-name: Building PollyGram ${{inputs.version-tag}}
+
+jobs:
+    apk:
+        name: Generate APK
+        runs-on: ubuntu-latest
+        timeout-minutes: 120
+        env:
+            CCACHE_DIR: ${{github.workspace}}/.ccache
+            CCACHE_MAXSIZE: 2G
+            CCACHE_COMPILERCHECK: content
+            CCACHE_NOHASHDIR: "1"
+            CCACHE_SLOPPINESS: file_stat_matches,include_file_mtime,include_file_ctime,time_macros
+        steps:
+            -   name: Checkout
+                uses: actions/checkout@v6
+            -   name: Apply PollyGram changes
+                run: |
+                    python3 - <<'PYEOF'
+                    import pathlib, re
+
+                    def rd(p):
+                        with open(p, encoding="utf-8", newline="") as f:
+                            return f.read()
+
+                    def wr(p, s):
+                        q = pathlib.Path(p)
+                        q.parent.mkdir(parents=True, exist_ok=True)
+                        with open(q, "w", encoding="utf-8", newline="") as f:
+                            f.write(s)
+
+                    def sub(p, old, new):
+                        s = rd(p)
+                        assert s.count(old) == 1, "anchor not found exactly once in " + p
+                        wr(p, s.replace(old, new))
+
+                    def add_before_end(p, text):
+                        s = rd(p)
+                        i = s.rindex("</resources>")
+                        wr(p, s[:i] + text + s[i:])
+
+                    J = "TMessagesProj/src/main/java/org/telegram/"
+                    RES = "TMessagesProj/src/main/res/"
+
+                    # 1. App name in every locale
+                    for f in sorted(pathlib.Path(RES).glob("values*/strings.xml")):
+                        s = rd(f)
+                        s2 = re.sub(r'(<string name="AppName">)[^<]*(</string>)', r"\1PollyGram\2", s)
+                        s2 = re.sub(r'(<string name="AppNameBeta">)[^<]*(</string>)', r"\1PollyGram DEBUG\2", s2)
+                        if s2 != s:
+                            wr(f, s2)
+
+                    # 2. New strings (en + ru)
+                    add_before_end(RES + "values/strings.xml", r"""    <string name="PollyGramSettings">PollyGram</string>
+                        <string name="PollyGramSettingsInfo">Ghost mode, privacy</string>
+                        <string name="PollyGramPrivacy">Privacy</string>
+                        <string name="PollyGramGhostMode">Ghost mode</string>
+                        <string name="PollyGramGhostModeInfo">Chats are marked as read only on this device. The sender will not see the read receipt.</string>
+                        <string name="PollyGramHideTyping">Hide typing status</string>
+                        <string name="PollyGramHideTypingInfo">Others will not see that you are typing or recording a message.</string>
+                        <string name="PollyGramHidePhone">Hide my phone number in settings</string>
+                    """)
+                    add_before_end(RES + "values-ru/strings.xml", r"""    <string name="PollyGramSettings">PollyGram</string>
+                        <string name="PollyGramSettingsInfo">Призрачный режим, приватность</string>
+                        <string name="PollyGramPrivacy">Приватность</string>
+                        <string name="PollyGramGhostMode">Призрачный режим</string>
+                        <string name="PollyGramGhostModeInfo">Чаты отмечаются прочитанными только на этом устройстве. Отправитель не увидит отметку о прочтении.</string>
+                        <string name="PollyGramHideTyping">Скрывать статус «печатает…»</string>
+                        <string name="PollyGramHideTypingInfo">Собеседники не увидят, что вы печатаете или записываете сообщение.</string>
+                        <string name="PollyGramHidePhone">Скрывать мой номер в настройках</string>
+                    """)
+
+                    # 3. New files
+                    wr(J + "messenger/PollyGramConfig.java", r"""/*
+                     * PollyGram settings storage.
+                     * PollyGram is a fork of Telegraher / Telegram for Android and is distributed
+                     * under the GNU General Public License v3 or later, the same as its upstream.
+                     */
+                    package org.telegram.messenger;
+
+                    import android.content.Context;
+                    import android.content.SharedPreferences;
+
+                    public class PollyGramConfig {
+
+                        public static final String VERSION = "0.1.0";
+
+                        private static final String PREFS_NAME = "pollygram";
+                        private static final String KEY_GHOST_MODE = "ghost_mode";
+                        private static final String KEY_HIDE_TYPING = "hide_typing";
+                        private static final String KEY_HIDE_PHONE = "hide_phone";
+
+                        private static boolean loaded;
+                        private static volatile boolean ghostMode;
+                        private static volatile boolean hideTyping;
+                        private static volatile boolean hidePhone;
+
+                        private static SharedPreferences prefs() {
+                            return ApplicationLoader.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                        }
+
+                        private static synchronized void load() {
+                            if (loaded) {
+                                return;
+                            }
+                            SharedPreferences p = prefs();
+                            ghostMode = p.getBoolean(KEY_GHOST_MODE, false);
+                            hideTyping = p.getBoolean(KEY_HIDE_TYPING, false);
+                            hidePhone = p.getBoolean(KEY_HIDE_PHONE, false);
+                            loaded = true;
+                        }
+
+                        /** When on, read receipts are not sent to the server (messages are still marked read locally). */
+                        public static boolean isGhostMode() {
+                            load();
+                            return ghostMode;
+                        }
+
+                        public static void setGhostMode(boolean value) {
+                            load();
+                            ghostMode = value;
+                            prefs().edit().putBoolean(KEY_GHOST_MODE, value).apply();
+                        }
+
+                        /** When on, the "typing..." status (and other chat actions) is not sent. */
+                        public static boolean isHideTyping() {
+                            load();
+                            return hideTyping;
+                        }
+
+                        public static void setHideTyping(boolean value) {
+                            load();
+                            hideTyping = value;
+                            prefs().edit().putBoolean(KEY_HIDE_TYPING, value).apply();
+                        }
+
+                        /** When on, own phone number is not shown in the settings header. */
+                        public static boolean isHidePhone() {
+                            load();
+                            return hidePhone;
+                        }
+
+                        public static void setHidePhone(boolean value) {
+                            load();
+                            hidePhone = value;
+                            prefs().edit().putBoolean(KEY_HIDE_PHONE, value).apply();
+                        }
+                    }
+                    """)
+                    wr(J + "ui/PollyGramSettingsActivity.java", r"""/*
+                     * PollyGram settings screen.
+                     * PollyGram is a fork of Telegraher / Telegram for Android and is distributed
+                     * under the GNU General Public License v3 or later, the same as its upstream.
+                     */
+                    package org.telegram.ui;
+
+                    import static org.telegram.messenger.LocaleController.getString;
+
+                    import android.view.View;
+
+                    import org.telegram.messenger.BuildVars;
+                    import org.telegram.messenger.PollyGramConfig;
+                    import org.telegram.messenger.R;
+                    import org.telegram.ui.Cells.TextCheckCell;
+                    import org.telegram.ui.Components.UItem;
+                    import org.telegram.ui.Components.UniversalAdapter;
+                    import org.telegram.ui.Components.UniversalFragment;
+
+                    import java.util.ArrayList;
+
+                    public class PollyGramSettingsActivity extends UniversalFragment {
+
+                        private static final int ID_GHOST_MODE = 1;
+                        private static final int ID_HIDE_TYPING = 2;
+                        private static final int ID_HIDE_PHONE = 3;
+
+                        @Override
+                        protected CharSequence getTitle() {
+                            return getString(R.string.PollyGramSettings);
+                        }
+
+                        @Override
+                        protected void fillItems(ArrayList<UItem> items, UniversalAdapter adapter) {
+                            items.add(UItem.asHeader(getString(R.string.PollyGramPrivacy)));
+                            items.add(UItem.asCheck(ID_GHOST_MODE, getString(R.string.PollyGramGhostMode)).setChecked(PollyGramConfig.isGhostMode()));
+                            items.add(UItem.asShadow(getString(R.string.PollyGramGhostModeInfo)));
+                            items.add(UItem.asCheck(ID_HIDE_TYPING, getString(R.string.PollyGramHideTyping)).setChecked(PollyGramConfig.isHideTyping()));
+                            items.add(UItem.asShadow(getString(R.string.PollyGramHideTypingInfo)));
+                            items.add(UItem.asCheck(ID_HIDE_PHONE, getString(R.string.PollyGramHidePhone)).setChecked(PollyGramConfig.isHidePhone()));
+                            items.add(UItem.asShadow("PollyGram " + PollyGramConfig.VERSION + " · " + BuildVars.BUILD_VERSION_STRING));
+                        }
+
+                        @Override
+                        protected void onClick(UItem item, View view, int position, float x, float y) {
+                            if (item.id == ID_GHOST_MODE) {
+                                PollyGramConfig.setGhostMode(!PollyGramConfig.isGhostMode());
+                                ((TextCheckCell) view).setChecked(PollyGramConfig.isGhostMode());
+                            } else if (item.id == ID_HIDE_TYPING) {
+                                PollyGramConfig.setHideTyping(!PollyGramConfig.isHideTyping());
+                                ((TextCheckCell) view).setChecked(PollyGramConfig.isHideTyping());
+                            } else if (item.id == ID_HIDE_PHONE) {
+                                PollyGramConfig.setHidePhone(!PollyGramConfig.isHidePhone());
+                                ((TextCheckCell) view).setChecked(PollyGramConfig.isHidePhone());
+                            }
+                        }
+
+                        @Override
+                        protected boolean onLongClick(UItem item, View view, int position, float x, float y) {
+                            return false;
+                        }
+                    }
+                    """)
+
+                    # 4. Hooks in existing code
+                    sub(J + "messenger/MessagesController.java",
+                        """    public boolean sendTyping(long dialogId, long threadMsgId, int action, String emojicon, int classGuid) {
+                            if (action < 0 || action >= sendingTypings.length || dialogId == 0) {
+                                return false;
+                            }""",
+                        """    public boolean sendTyping(long dialogId, long threadMsgId, int action, String emojicon, int classGuid) {
+                            if (PollyGramConfig.isHideTyping()) {
+                                return false;
+                            }
+                            if (action < 0 || action >= sendingTypings.length || dialogId == 0) {
+                                return false;
+                            }""")
+                    sub(J + "messenger/MessagesController.java",
+                        """    private void completeReadTask(ReadTask task) {
+                            if (task.replyId != 0 && task.monoForumPeerId == 0) {""",
+                        """    private void completeReadTask(ReadTask task) {
+                            if (PollyGramConfig.isGhostMode()) {
+                                return;
+                            }
+                            if (task.replyId != 0 && task.monoForumPeerId == 0) {""")
+                    sub(J + "ui/SettingsActivity.java",
+                        """        if (user != null) {
+                                sb.append(PhoneFormat.getInstance().format("+" + user.phone));
+                            }
+                            final String username = UserObject.getPublicUsername(user);
+                            if (username != null) {
+                                sb.append(" • @").append(username);
+                            }
+                            subtitleView.setText(sb);""",
+                        """        if (user != null && !org.telegram.messenger.PollyGramConfig.isHidePhone()) {
+                                sb.append(PhoneFormat.getInstance().format("+" + user.phone));
+                            }
+                            final String username = UserObject.getPublicUsername(user);
+                            if (username != null) {
+                                if (sb.length() > 0) {
+                                    sb.append(" • ");
+                                }
+                                sb.append("@").append(username);
+                            }
+                            subtitleView.setText(sb);""")
+                    sub(J + "ui/SettingsActivity.java",
+                        """        items.add(SettingCell.Factory.of(1, IconBackgroundColors.BLUE.top, IconBackgroundColors.BLUE.bottom, R.drawable.settings_account, getString(R.string.SettingsAccount), getString(R.string.SettingsAccountInfo)));""",
+                        """        items.add(SettingCell.Factory.of(30, IconBackgroundColors.GREEN.top, IconBackgroundColors.GREEN.bottom, R.drawable.settings_features, getString(R.string.PollyGramSettings), getString(R.string.PollyGramSettingsInfo)));
+                            items.add(SettingCell.Factory.of(1, IconBackgroundColors.BLUE.top, IconBackgroundColors.BLUE.bottom, R.drawable.settings_account, getString(R.string.SettingsAccount), getString(R.string.SettingsAccountInfo)));""")
+                    sub(J + "ui/SettingsActivity.java",
+                        """            case 9:
+                                    presentSettingFragment(new LiteModeSettingsActivity());
+                                    break;""",
+                        """            case 9:
+                                    presentSettingFragment(new LiteModeSettingsActivity());
+                                    break;
+                                case 30:
+                                    presentSettingFragment(new PollyGramSettingsActivity());
+                                    break;""")
+                    print("PollyGram changes applied")
+                    PYEOF
+            -   name: Set up Corretto 21
+                uses: actions/setup-java@v5
+                with:
+                    java-version: '21'
+                    distribution: 'corretto'
+                    architecture: x64
+            -   name: Setup Gradle 8.14.5
+                uses: gradle/actions/setup-gradle@v6
+                with:
+                    gradle-version: '8.14.5'
+            -   name: Pin CMake 3.22.1 and NDK 27.2.12479018
+                run: |
+                    set -euo pipefail
+                    SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+                    CMAKE_DIR="${ANDROID_HOME}/cmake/3.22.1"
+                    NDK_DIR="${ANDROID_HOME}/ndk/27.2.12479018"
+                    install_pkg() {
+                      set +o pipefail
+                      echo y | "${SDKMANAGER}" --install "$1"
+                      set -o pipefail
+                    }
+                    if [ ! -x "${CMAKE_DIR}/bin/cmake" ]; then install_pkg "cmake;3.22.1"; fi
+                    if [ ! -d "${NDK_DIR}" ]; then install_pkg "ndk;27.2.12479018"; fi
+                    printf 'sdk.dir=%s\ncmake.dir=%s\n' "${ANDROID_HOME}" "${CMAKE_DIR}" > local.properties
+                    echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "${GITHUB_ENV}"
+                    "${CMAKE_DIR}/bin/cmake" --version
+            -   name: Install ccache
+                run: |
+                    sudo apt-get update
+                    sudo apt-get install -y ccache
+                    mkdir -p "${CCACHE_DIR}"
+            -   name: Build APK
+                run: gradle :TMessagesProj_AppStandalone:assembleStandalone
+            -   name: Locate APK
+                id: locate_apk
+                run: |
+                    APK_PATH="${GITHUB_WORKSPACE}/TMessagesProj_AppStandalone/build/outputs/apk/afat/standalone/app.apk"
+                    if [ ! -f "$APK_PATH" ]; then
+                       find "${GITHUB_WORKSPACE}/TMessagesProj_AppStandalone/build/outputs" -type f >&2
+                       exit 1
+                    fi
+                    OUT="${GITHUB_WORKSPACE}/PollyGram.${{inputs.version-tag}}.apk"
+                    mv "$APK_PATH" "$OUT"
+                    echo "apk_path=$OUT" >> "$GITHUB_OUTPUT"
+                    echo "sha256: $(sha256sum "$OUT" | awk '{print $1}')"
+            -   name: Upload APK
+                uses: actions/upload-artifact@v4
+                with:
+                    name: PollyGram-${{inputs.version-tag}}
+                    path: ${{steps.locate_apk.outputs.apk_path}}
+                    if-no-files-found: error
